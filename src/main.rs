@@ -2,13 +2,16 @@ extern crate ndarray;
 extern crate ndarray_rand;
 extern crate rand;
 
-use std::{error::Error, fs::File, io::Read};
+use std::{cell::RefCell, error::Error, fs::File, io::Read, rc::Rc};
 
 use mnist::*;
 use ndarray::{prelude::*, ShapeError};
 use ndarray_rand::RandomExt;
 use rand::distributions::Uniform;
 use serde::{Deserialize, Serialize};
+thread_local! {
+    static MNIST_DATA: Rc<RefCell<Option<MnistData>>> = Rc::new(RefCell::new(None));
+}
 
 trait NeuralNetworkLayer {
     fn forward(&mut self, inputs: &Array1<f32>) -> Array1<f32>;
@@ -28,7 +31,9 @@ enum Layer {
         num_inputs: usize,
         num_outputs: usize,
     },
-    Sigmoid,
+    Sigmoid {
+        input: Array1<f32>,
+    },
 }
 
 impl Layer {
@@ -39,6 +44,11 @@ impl Layer {
             input: Array1::zeros(num_inputs),
             num_inputs,
             num_outputs,
+        }
+    }
+    fn sigmoid() -> Self {
+        Self::Sigmoid {
+            input: Array1::zeros(1),
         }
     }
 }
@@ -55,7 +65,10 @@ impl NeuralNetworkLayer for Layer {
                 *input = inputs.clone();
                 weights.dot(inputs) + &*biases
             }
-            Self::Sigmoid => inputs.mapv(sigmoid),
+            Self::Sigmoid { input, .. } => {
+                *input = inputs.clone();
+                inputs.mapv(sigmoid)
+            }
         }
     }
 
@@ -79,10 +92,13 @@ impl NeuralNetworkLayer for Layer {
                 *biases = &*biases - output_gradient.mapv(|x| x * learning_rate);
                 weights.t().dot(output_gradient)
             }
-            Self::Sigmoid => output_gradient.mapv(|x| {
-                let sig = sigmoid(x);
-                sig * (1.0 - sig)
-            }),
+            Self::Sigmoid { input, .. } => {
+                output_gradient
+                    * input.mapv(|x| {
+                        let sig = sigmoid(x);
+                        sig * (1.0 - sig)
+                    })
+            }
         }
     }
 }
@@ -90,7 +106,7 @@ impl NeuralNetworkLayer for Layer {
 impl From<Layer> for LayerData {
     fn from(layer: Layer) -> LayerData {
         match layer {
-            Layer::Sigmoid => LayerData::Sigmoid,
+            Layer::Sigmoid { .. } => LayerData::Sigmoid,
             Layer::DenseLayer {
                 weights,
                 biases,
@@ -108,11 +124,11 @@ impl From<Layer> for LayerData {
 }
 
 fn mse(output: &Array1<f32>, expected_output: &Array1<f32>) -> f32 {
-    (expected_output - output).mapv(|x| x * x).sum()
+    (expected_output - output).mapv(|x| x * x).sum() / output.shape()[0] as f32
 }
 
 fn mse_prime(output: &Array1<f32>, expected_output: &Array1<f32>) -> Array1<f32> {
-    (expected_output - output).mapv(|x| 2.0 * x / expected_output.len() as f32)
+    (output - expected_output).mapv(|x| 2.0 * x / expected_output.len() as f32)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -130,7 +146,7 @@ impl TryFrom<LayerData> for Layer {
     type Error = ShapeError;
     fn try_from(value: LayerData) -> Result<Self, Self::Error> {
         let layer = match value {
-            LayerData::Sigmoid => Layer::Sigmoid,
+            LayerData::Sigmoid => Layer::sigmoid(),
             LayerData::DenseLayer {
                 weights,
                 biases,
@@ -151,20 +167,13 @@ impl TryFrom<LayerData> for Layer {
 #[derive(Debug, Serialize, Deserialize)]
 struct NeuralNetworkData {
     layers: Vec<LayerData>,
-    inputs: Vec<f32>,
-    expected_outputs: Vec<f32>,
-    num_epochs: usize,
-    learning_rate: f32,
-    input_shape: (usize, usize),
-    expected_output_shape: (usize, usize),
+    accuracy: f32,
 }
 
+#[derive(Debug, Clone)]
 struct NeuralNetwork {
     layers: Vec<Layer>,
-    inputs: Array2<f32>,
-    expected_outputs: Array2<f32>,
-    num_epochs: usize,
-    learning_rate: f32,
+    accuracy: f32,
 }
 
 impl NeuralNetwork {
@@ -176,15 +185,28 @@ impl NeuralNetwork {
         output
     }
 
-    fn train(&mut self) {
-        for _ in 0..self.num_epochs {
+    fn train(
+        &mut self,
+        inputs: &Array2<f32>,
+        expected_outputs: &Array2<f32>,
+        test_inputs: &Array2<f32>,
+        test_expected_outputs: &Array2<f32>,
+        num_epochs: usize,
+        learning_rate: f32,
+    ) {
+        let neural_network_data: Result<NeuralNetworkData, Box<dyn Error>> =
+            Self::load().map(|nn| (&nn).into());
+        let mut neural_network_data: NeuralNetworkData = neural_network_data.unwrap_or_else(|_| {
+            let _ = self.save();
+            (&*self).into()
+        });
+        for _ in 0..num_epochs {
             let mut error = 0.0;
-            for (input, expected_output) in self
-                .inputs
+            for (input, expected_output) in inputs
                 .clone()
                 .rows()
                 .into_iter()
-                .zip(self.expected_outputs.clone().rows())
+                .zip(expected_outputs.clone().rows())
             {
                 let input = input.mapv(|x| x);
                 let expected_output = expected_output.mapv(|x| x);
@@ -192,15 +214,23 @@ impl NeuralNetwork {
                 error += mse(&output, &expected_output);
                 let mut gradient = mse_prime(&output, &expected_output);
                 for layer in self.layers.iter_mut().rev() {
-                    gradient = layer.backward(&gradient, self.learning_rate);
+                    gradient = layer.backward(&gradient, learning_rate);
                 }
             }
-            println!("Error: {}", error / self.inputs.shape()[0] as f32);
+
+            let accuracy = self.test(test_inputs, test_expected_outputs);
+            println!("Error: {:.8}, Accuracy: {:.2}%", error / inputs.shape()[0] as f32, accuracy * 100.0);
+
+            if accuracy > neural_network_data.accuracy {
+                neural_network_data = (&*self).into();
+                let _ = self.save();
+            }
         }
     }
 
     fn test(&mut self, inputs: &Array2<f32>, expected_outputs: &Array2<f32>) -> f32 {
         let mut wrong: usize = 0;
+        let total = inputs.clone().shape()[0];
         for (input, expected_output) in inputs
             .clone()
             .rows()
@@ -211,17 +241,23 @@ impl NeuralNetwork {
             let expected_output = expected_output.mapv(|x| x);
             let output = self.forward(input.clone());
             let answer = output
-                .to_vec()
-                .into_iter()
-                .fold(f32::NEG_INFINITY, f32::max);
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
             let expected_answer = expected_output
-                .into_iter()
-                .fold(f32::NEG_INFINITY, f32::max);
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i)
+                .unwrap();
             if answer != expected_answer {
                 wrong += 1;
             }
         }
-        1.0 - (wrong as f32 / self.inputs.len() as f32)
+        self.accuracy = 1.0 - (wrong as f32 / total as f32);
+        self.accuracy
     }
 
     fn save(&self) -> Result<(), Box<dyn Error>> {
@@ -243,18 +279,9 @@ impl NeuralNetwork {
 
 impl From<&NeuralNetwork> for NeuralNetworkData {
     fn from(value: &NeuralNetwork) -> Self {
-        let input_shape = value.inputs.shape();
-        let input_shape = (input_shape[0], input_shape[1]);
-        let expected_output_shape = value.expected_outputs.shape();
-        let expected_output_shape = (expected_output_shape[0], expected_output_shape[1]);
         NeuralNetworkData {
             layers: value.layers.clone().into_iter().map(|x| x.into()).collect(),
-            inputs: value.inputs.clone().into_raw_vec(),
-            expected_outputs: value.expected_outputs.clone().into_raw_vec(),
-            num_epochs: value.num_epochs,
-            input_shape,
-            expected_output_shape,
-            learning_rate: value.learning_rate,
+            accuracy: value.accuracy,
         }
     }
 }
@@ -266,13 +293,7 @@ impl TryFrom<NeuralNetworkData> for NeuralNetwork {
             value.layers.into_iter().map(|x| x.try_into()).collect();
         Ok(NeuralNetwork {
             layers: layers?,
-            inputs: Array2::from_shape_vec(value.input_shape, value.inputs)?,
-            expected_outputs: Array2::from_shape_vec(
-                value.expected_output_shape,
-                value.expected_outputs,
-            )?,
-            num_epochs: value.num_epochs,
-            learning_rate: value.learning_rate,
+            accuracy: value.accuracy,
         })
     }
 }
@@ -285,19 +306,22 @@ fn get_trained_model() -> NeuralNetwork {
             let mut neural_network = NeuralNetwork {
                 layers: vec![
                     Layer::random_layer(28 * 28, 16),
-                    Layer::Sigmoid,
+                    Layer::sigmoid(),
                     Layer::random_layer(16, 16),
-                    Layer::Sigmoid,
+                    Layer::sigmoid(),
                     Layer::random_layer(16, 10),
-                    Layer::Sigmoid,
+                    Layer::sigmoid(),
                 ],
-                inputs: mnist_data.train_images,
-                expected_outputs: mnist_data.train_labels,
-                num_epochs: 10,
-                learning_rate: 0.0001,
+                accuracy: 0.0,
             };
-            neural_network.train();
-            let _ = neural_network.save();
+            neural_network.train(
+                &mnist_data.train_images,
+                &mnist_data.train_labels,
+                &mnist_data.test_images,
+                &mnist_data.test_labels,
+                1000,
+                0.001,
+            );
             neural_network
         }
     }
@@ -307,9 +331,10 @@ fn main() {
     let mnist_data = load_mnist_data().unwrap();
     let mut model = get_trained_model();
     let accuracy = model.test(&mnist_data.test_images, &mnist_data.test_labels);
-    println!("Accuracy: {:.2}", accuracy * 100.0);
+    println!("accuracy: {:.2}%", accuracy * 100.0);
 }
 
+#[derive(Debug, Clone)]
 struct MnistData {
     train_images: Array2<f32>,
     train_labels: Array2<f32>,
@@ -318,27 +343,33 @@ struct MnistData {
 }
 
 fn load_mnist_data() -> Result<MnistData, ShapeError> {
-    let training_sample: usize = 50_000;
+    MNIST_DATA.with(|data| {
+        if let Some(data) = &*data.clone().borrow() {
+            return Ok(data.clone());
+        }
+        let training_sample: usize = 50_000;
 
-    let Mnist {
-        trn_img,
-        trn_lbl,
-        tst_img,
-        tst_lbl,
-        ..
-    } = MnistBuilder::new()
-        .label_format_one_hot()
-        .training_set_length(training_sample as u32)
-        .validation_set_length(10_000)
-        .test_set_length(10_000)
-        .finalize();
-
-    Ok(MnistData {
-        train_images: Array2::from_shape_vec((training_sample, 28usize * 28), trn_img)?
-            .mapv(|x| x as f32),
-        train_labels: Array2::from_shape_vec((training_sample, 10usize), trn_lbl)?
-            .mapv(|x| x as f32),
-        test_images: Array2::from_shape_vec((10_000, 28 * 28), tst_img)?.mapv(|x| x as f32),
-        test_labels: Array2::from_shape_vec((10_000, 10), tst_lbl)?.mapv(|x| x as f32),
+        let Mnist {
+            trn_img,
+            trn_lbl,
+            tst_img,
+            tst_lbl,
+            ..
+        } = MnistBuilder::new()
+            .label_format_one_hot()
+            .training_set_length(training_sample as u32)
+            .validation_set_length(10_000)
+            .test_set_length(10_000)
+            .finalize();
+        let new_data = MnistData {
+            train_images: Array2::from_shape_vec((training_sample, 28usize * 28), trn_img)?
+                .mapv(|x| x as f32),
+            train_labels: Array2::from_shape_vec((training_sample, 10usize), trn_lbl)?
+                .mapv(|x| x as f32),
+            test_images: Array2::from_shape_vec((10_000, 28 * 28), tst_img)?.mapv(|x| x as f32),
+            test_labels: Array2::from_shape_vec((10_000, 10), tst_lbl)?.mapv(|x| x as f32),
+        };
+        *data.borrow_mut() = Some(new_data.clone());
+        Ok(new_data)
     })
 }

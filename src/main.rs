@@ -3,12 +3,14 @@ extern crate ndarray_rand;
 extern crate rand;
 
 use std::{cell::RefCell, error::Error, fs::File, io::Read, rc::Rc};
-
 use mnist::*;
-use ndarray::{prelude::*, ShapeError};
+use ndarray::{prelude::*, stack, ShapeError};
 use ndarray_rand::RandomExt;
 use rand::distributions::Uniform;
 use serde::{Deserialize, Serialize};
+
+const SAVE_FILE: &str = "./data.json";
+
 thread_local! {
     static MNIST_DATA: Rc<RefCell<Option<MnistData>>> = Rc::new(RefCell::new(None));
 }
@@ -34,6 +36,12 @@ enum Layer {
     Sigmoid {
         input: Array1<f32>,
     },
+    Softmax {
+        output: Array1<f32>,
+    },
+    Tanh {
+        input: Array1<f32>,
+    },
 }
 
 impl Layer {
@@ -46,8 +54,21 @@ impl Layer {
             num_outputs,
         }
     }
+
     fn sigmoid() -> Self {
         Self::Sigmoid {
+            input: Array1::zeros(1),
+        }
+    }
+
+    fn softmax() -> Self {
+        Self::Softmax {
+            output: Array1::zeros(1),
+        }
+    }
+
+    fn tanh() -> Self {
+        Self::Tanh {
             input: Array1::zeros(1),
         }
     }
@@ -65,9 +86,19 @@ impl NeuralNetworkLayer for Layer {
                 *input = inputs.clone();
                 weights.dot(inputs) + &*biases
             }
-            Self::Sigmoid { input, .. } => {
+            Self::Sigmoid { input } => {
                 *input = inputs.clone();
                 inputs.mapv(sigmoid)
+            }
+            Self::Softmax { output } => {
+                let tmp = inputs.mapv(f32::exp);
+                let sum = tmp.clone().sum();
+                *output = tmp / sum;
+                output.clone()
+            }
+            Self::Tanh { input } => {
+                *input = inputs.clone();
+                inputs.mapv(|x| x.tanh())
             }
         }
     }
@@ -92,13 +123,22 @@ impl NeuralNetworkLayer for Layer {
                 *biases = &*biases - output_gradient.mapv(|x| x * learning_rate);
                 weights.t().dot(output_gradient)
             }
-            Self::Sigmoid { input, .. } => {
+            Self::Sigmoid { input } => {
                 output_gradient
                     * input.mapv(|x| {
                         let sig = sigmoid(x);
                         sig * (1.0 - sig)
                     })
             }
+            Self::Softmax { output } => {
+                let n = output.len();
+                let repeated = (0..n).map(|_| output.view()).collect::<Vec<_>>();
+                let tiled = stack(Axis(0), &repeated).unwrap().mapv(|x| x);
+                let identity =
+                    Array2::<f32>::from_shape_fn((n, n), |(i, j)| if i == j { 1.0 } else { 0.0 });
+                (tiled.clone() * (identity - tiled.t())).dot(output_gradient)
+            }
+            Self::Tanh { input } => output_gradient * input.mapv(|x| 1.0 - x.tanh().powi(2)),
         }
     }
 }
@@ -107,6 +147,8 @@ impl From<Layer> for LayerData {
     fn from(layer: Layer) -> LayerData {
         match layer {
             Layer::Sigmoid { .. } => LayerData::Sigmoid,
+            Layer::Softmax { .. } => LayerData::Softmax,
+            Layer::Tanh { .. } => LayerData::Tanh,
             Layer::DenseLayer {
                 weights,
                 biases,
@@ -134,6 +176,8 @@ fn mse_prime(output: &Array1<f32>, expected_output: &Array1<f32>) -> Array1<f32>
 #[derive(Debug, Serialize, Deserialize, Clone)]
 enum LayerData {
     Sigmoid,
+    Softmax,
+    Tanh,
     DenseLayer {
         weights: Vec<f32>,
         biases: Vec<f32>,
@@ -147,6 +191,8 @@ impl TryFrom<LayerData> for Layer {
     fn try_from(value: LayerData) -> Result<Self, Self::Error> {
         let layer = match value {
             LayerData::Sigmoid => Layer::sigmoid(),
+            LayerData::Softmax => Layer::softmax(),
+            LayerData::Tanh => Layer::tanh(),
             LayerData::DenseLayer {
                 weights,
                 biases,
@@ -167,13 +213,11 @@ impl TryFrom<LayerData> for Layer {
 #[derive(Debug, Serialize, Deserialize)]
 struct NeuralNetworkData {
     layers: Vec<LayerData>,
-    accuracy: f32,
 }
 
 #[derive(Debug, Clone)]
 struct NeuralNetwork {
     layers: Vec<Layer>,
-    accuracy: f32,
 }
 
 impl NeuralNetwork {
@@ -189,17 +233,9 @@ impl NeuralNetwork {
         &mut self,
         inputs: &Array2<f32>,
         expected_outputs: &Array2<f32>,
-        test_inputs: &Array2<f32>,
-        test_expected_outputs: &Array2<f32>,
         num_epochs: usize,
         learning_rate: f32,
     ) {
-        let neural_network_data: Result<NeuralNetworkData, Box<dyn Error>> =
-            Self::load().map(|nn| (&nn).into());
-        let mut neural_network_data: NeuralNetworkData = neural_network_data.unwrap_or_else(|_| {
-            let _ = self.save();
-            (&*self).into()
-        });
         for _ in 0..num_epochs {
             let mut error = 0.0;
             for (input, expected_output) in inputs
@@ -218,13 +254,10 @@ impl NeuralNetwork {
                 }
             }
 
-            let accuracy = self.test(test_inputs, test_expected_outputs);
-            println!("Error: {:.8}, Accuracy: {:.2}%", error / inputs.shape()[0] as f32, accuracy * 100.0);
-
-            if accuracy > neural_network_data.accuracy {
-                neural_network_data = (&*self).into();
-                let _ = self.save();
-            }
+            println!(
+                "Error: {:.8}",
+                error / inputs.shape()[0] as f32,
+            );
         }
     }
 
@@ -256,20 +289,19 @@ impl NeuralNetwork {
                 wrong += 1;
             }
         }
-        self.accuracy = 1.0 - (wrong as f32 / total as f32);
-        self.accuracy
+        1.0 - (wrong as f32 / total as f32)
     }
 
     fn save(&self) -> Result<(), Box<dyn Error>> {
         let data: NeuralNetworkData = self.into();
         Ok(std::fs::write(
-            "./data.json",
+            SAVE_FILE,
             serde_json::to_string(&data)?,
         )?)
     }
 
     fn load() -> Result<Self, Box<dyn Error>> {
-        let mut file = File::open("./data.json")?;
+        let mut file = File::open(SAVE_FILE)?;
         let mut string = String::new();
         file.read_to_string(&mut string)?;
         let data: NeuralNetworkData = serde_json::from_str(&string)?;
@@ -281,7 +313,6 @@ impl From<&NeuralNetwork> for NeuralNetworkData {
     fn from(value: &NeuralNetwork) -> Self {
         NeuralNetworkData {
             layers: value.layers.clone().into_iter().map(|x| x.into()).collect(),
-            accuracy: value.accuracy,
         }
     }
 }
@@ -293,7 +324,6 @@ impl TryFrom<NeuralNetworkData> for NeuralNetwork {
             value.layers.into_iter().map(|x| x.try_into()).collect();
         Ok(NeuralNetwork {
             layers: layers?,
-            accuracy: value.accuracy,
         })
     }
 }
@@ -305,23 +335,21 @@ fn get_trained_model() -> NeuralNetwork {
             let mnist_data = load_mnist_data().unwrap();
             let mut neural_network = NeuralNetwork {
                 layers: vec![
-                    Layer::random_layer(28 * 28, 16),
-                    Layer::sigmoid(),
-                    Layer::random_layer(16, 16),
-                    Layer::sigmoid(),
+                    Layer::random_layer(28 * 28, 64),
+                    Layer::tanh(),
+                    Layer::random_layer(64, 16),
+                    Layer::tanh(),
                     Layer::random_layer(16, 10),
-                    Layer::sigmoid(),
+                    Layer::softmax(),
                 ],
-                accuracy: 0.0,
             };
             neural_network.train(
                 &mnist_data.train_images,
                 &mnist_data.train_labels,
-                &mnist_data.test_images,
-                &mnist_data.test_labels,
                 1000,
-                0.001,
+                0.005,
             );
+            let _ = neural_network.save();
             neural_network
         }
     }

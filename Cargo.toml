@@ -1,7 +1,7 @@
 [package]
 name = "handwritten-digit-recognition"
 version = "0.1.0"
-authors = ["Dilshad <dilshadplayingminecraft@outlook.com>"]
+authors = ["Dilshad <a-rustacean@outlook.com>"]
 edition = "2021"
 
 [dependencies]

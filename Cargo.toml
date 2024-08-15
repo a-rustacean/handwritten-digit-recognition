@@ -6,7 +6,7 @@ edition = "2021"
 
 [dependencies]
 mnist = "0.6.0"
-ndarray = "0.16.0"
+ndarray = "0.16.1"
 ndarray-rand = "0.15.0"
 rand = "0.8.5"
 serde = { version = "1.0.207", features = ["derive"] }

@@ -1,13 +1,8 @@
-extern crate ndarray;
-extern crate ndarray_rand;
-extern crate rand;
-
-use std::{cell::RefCell, error::Error, fs::File, io::Read, rc::Rc};
 use mnist::*;
 use ndarray::{prelude::*, stack, ShapeError};
-use ndarray_rand::RandomExt;
-use rand::distributions::Uniform;
+use ndarray_rand::{rand_distr::Uniform, RandomExt};
 use serde::{Deserialize, Serialize};
+use std::{cell::RefCell, error::Error, fs::File, io::Read, rc::Rc};
 
 const SAVE_FILE: &str = "./data.json";
 
@@ -26,7 +21,7 @@ fn sigmoid(x: f32) -> f32 {
 
 #[derive(Debug, Clone)]
 enum Layer {
-    DenseLayer {
+    Dense {
         weights: Array2<f32>,
         biases: Array1<f32>,
         input: Array1<f32>,
@@ -46,7 +41,7 @@ enum Layer {
 
 impl Layer {
     fn random_layer(num_inputs: usize, num_outputs: usize) -> Self {
-        Self::DenseLayer {
+        Self::Dense {
             weights: Array2::random((num_outputs, num_inputs), Uniform::new(-1.0, 1.0)),
             biases: Array1::random(num_outputs, Uniform::new(0.0, 1.0)),
             input: Array1::zeros(num_inputs),
@@ -77,7 +72,7 @@ impl Layer {
 impl NeuralNetworkLayer for Layer {
     fn forward(&mut self, inputs: &Array1<f32>) -> Array1<f32> {
         match self {
-            Self::DenseLayer {
+            Self::Dense {
                 weights,
                 biases,
                 input,
@@ -105,7 +100,7 @@ impl NeuralNetworkLayer for Layer {
 
     fn backward(&mut self, output_gradient: &Array1<f32>, learning_rate: f32) -> Array1<f32> {
         match self {
-            Self::DenseLayer {
+            Self::Dense {
                 weights,
                 biases,
                 input,
@@ -149,14 +144,14 @@ impl From<Layer> for LayerData {
             Layer::Sigmoid { .. } => LayerData::Sigmoid,
             Layer::Softmax { .. } => LayerData::Softmax,
             Layer::Tanh { .. } => LayerData::Tanh,
-            Layer::DenseLayer {
+            Layer::Dense {
                 weights,
                 biases,
                 num_inputs,
                 num_outputs,
                 ..
             } => LayerData::DenseLayer {
-                weights: weights.into_raw_vec(),
+                weights: weights.into_raw_vec_and_offset().0,
                 biases: biases.to_vec(),
                 num_inputs,
                 num_outputs,
@@ -198,7 +193,7 @@ impl TryFrom<LayerData> for Layer {
                 biases,
                 num_inputs,
                 num_outputs,
-            } => Layer::DenseLayer {
+            } => Layer::Dense {
                 weights: Array2::from_shape_vec((num_outputs, num_inputs), weights)?,
                 biases: Array1::from_vec(biases),
                 input: Array1::zeros(num_inputs),
@@ -254,10 +249,7 @@ impl NeuralNetwork {
                 }
             }
 
-            println!(
-                "Error: {:.8}",
-                error / inputs.shape()[0] as f32,
-            );
+            println!("Error: {:.8}", error / inputs.shape()[0] as f32,);
         }
     }
 
@@ -294,10 +286,7 @@ impl NeuralNetwork {
 
     fn save(&self) -> Result<(), Box<dyn Error>> {
         let data: NeuralNetworkData = self.into();
-        Ok(std::fs::write(
-            SAVE_FILE,
-            serde_json::to_string(&data)?,
-        )?)
+        Ok(std::fs::write(SAVE_FILE, serde_json::to_string(&data)?)?)
     }
 
     fn load() -> Result<Self, Box<dyn Error>> {
@@ -322,9 +311,7 @@ impl TryFrom<NeuralNetworkData> for NeuralNetwork {
     fn try_from(value: NeuralNetworkData) -> Result<Self, Self::Error> {
         let layers: Result<Vec<Layer>, ShapeError> =
             value.layers.into_iter().map(|x| x.try_into()).collect();
-        Ok(NeuralNetwork {
-            layers: layers?,
-        })
+        Ok(NeuralNetwork { layers: layers? })
     }
 }
 

@@ -18,6 +18,7 @@ jobs:
         with:
           toolchain: stable
           override: true
+          components: clippy
 
       - run: |
           cargo +nightly clippy -Z unstable-options -- -D warnings

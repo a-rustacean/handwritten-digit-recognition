@@ -9,5 +9,5 @@ mnist = "0.6.0"
 ndarray = "0.16.1"
 ndarray-rand = "0.15.0"
 rand = "0.9.2"
-serde = { version = "1.0.226", features = ["derive"] }
+serde = { version = "1.0.227", features = ["derive"] }
 serde_json = "1.0.145"
